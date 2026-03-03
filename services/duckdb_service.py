@@ -12,7 +12,7 @@ from data.seed import create_dummy_users, create_dummy_orders
 from security.sql_validator import prepare_query_for_duckdb
 
 # optional qlib loader (reads env vars)
-from services.qlib_service import load_qlib_dataframe
+from services.qlib_service import load_qlib_dataframes
 
 
 class DuckDBService:
@@ -30,26 +30,26 @@ class DuckDBService:
         # Register DataFrames as tables
         self._register_tables()
         # attempt to load qlib data if configured
-        self._maybe_load_qlib()
+        self._maybe_load_qlib_dataframes()
     
     def _register_tables(self) -> None:
         """Register DataFrames as DuckDB tables."""
         self.conn.register("users", self.users_df)
         self.conn.register("orders", self.orders_df)
 
-    def _maybe_load_qlib(self) -> None:
-        """Load qlib DataFrame and register if available."""
+    def _maybe_load_qlib_dataframes(self) -> None:
+        """Load qlib DataFrames and register if available."""
+        self.qlib_dfs = {}
         try:
-            df = load_qlib_dataframe()
-            if df is not None:
+            dfs = load_qlib_dataframes()
+            for name, df in dfs.items():
                 if df.empty:
-                    logging.getLogger(__name__).warning("qlib dataframe empty, skipping registration")
+                    logging.getLogger(__name__).warning(f"qlib dataframe {name} empty, skipping registration")
                 else:
-                    self.conn.register("qlib", df)
-                    # keep reference for later introspection
-                    self.qlib_df = df
+                    self.conn.register(name, df)
+                    self.qlib_dfs[name] = df
                     logging.getLogger(__name__).info(
-                        f"Loaded qlib dataframe with {len(df):,} rows and {len(df.columns):,} columns"
+                        f"Loaded qlib dataframe {name} with {len(df):,} rows and {len(df.columns):,} columns"
                     )
         except Exception as e:
             # fail gracefully; we still have users/orders tables
@@ -116,7 +116,11 @@ class DuckDBService:
         """
         schema_info = {}
         
-        for table_name in ["users", "orders"]:
+        table_names = ["users", "orders"]
+        if hasattr(self, 'qlib_dfs'):
+            table_names.extend(list(self.qlib_dfs.keys()))
+
+        for table_name in table_names:
             result = self.conn.execute(f"DESCRIBE {table_name}").df()
             schema_info[table_name] = result.to_dict(orient="records")
         
@@ -134,6 +138,9 @@ class DuckDBService:
             Dict with sample data
         """
         valid_tables = ["users", "orders"]
+        if hasattr(self, 'qlib_dfs'):
+            valid_tables.extend(list(self.qlib_dfs.keys()))
+            
         if table_name not in valid_tables:
             return {
                 "success": False,
