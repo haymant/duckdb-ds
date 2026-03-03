@@ -1,0 +1,42 @@
+[project]
+name = "duckdb-query-api"
+version = "1.0.0"
+description = "FastAPI REST API with DuckDB SQL query interface"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "duckdb>=0.9.0",
+    "pandas>=2.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "numpy>=2.0.2",
+    "cython>=3.2.4",
+    "pyqlib>=0.9.7",
+    "protobuf==3.20.1",
+    "setuptools<82",
+]
+
+# The previous `[tool.uv]` section was not recognized by
+# PEP 621/`pip` and caused a parse error during installation.  It
+# appeared to be an attempt to pin a Python version for the `uvicorn`
+# CLI.  That configuration belongs in a separate config file (or
+# environment) and is not needed here, so it is removed.
+
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# setuptools needs explicit package discovery when a project uses a
+# flat layout with multiple top–level packages.  Without this section
+# an editable install will fail as we saw with the `pip install -e .`
+# invocation.
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "data*",
+    "services*",
+    "security*",
+    "examples*",
+]
