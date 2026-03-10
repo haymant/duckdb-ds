@@ -2,7 +2,7 @@
 name = "duckdb-query-api"
 version = "1.0.0"
 description = "FastAPI REST API with DuckDB SQL query interface"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.104.0",
     "uvicorn[standard]>=0.24.0",
@@ -11,10 +11,11 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
     "numpy>=2.0.2",
-    "cython>=3.2.4",
-    "pyqlib>=0.9.7",
-    "protobuf==3.20.1",
     "setuptools<82",
+    "fsspec>=2026.2.0",
+    "gcsfs>=2026.2.0",
+    "google-cloud-storage>=3.9.0",
+    "pyarrow>=23.0.1",
 ]
 
 # The previous `[tool.uv]` section was not recognized by

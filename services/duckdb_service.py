@@ -7,12 +7,12 @@ from typing import List, Dict, Any, Optional
 import logging
 import duckdb
 import pandas as pd
+import os
+import fsspec
+import gcsfs
 
 from data.seed import create_dummy_users, create_dummy_orders
 from security.sql_validator import prepare_query_for_duckdb
-
-# optional qlib loader (reads env vars)
-from services.qlib_service import load_qlib_dataframes
 
 
 class DuckDBService:
@@ -29,31 +29,45 @@ class DuckDBService:
         
         # Register DataFrames as tables
         self._register_tables()
-        # attempt to load qlib data if configured
-        self._maybe_load_qlib_dataframes()
+        # configure GCS credentials if environment variables are set
+        self._maybe_configure_gcs()
     
     def _register_tables(self) -> None:
         """Register DataFrames as DuckDB tables."""
         self.conn.register("users", self.users_df)
         self.conn.register("orders", self.orders_df)
 
-    def _maybe_load_qlib_dataframes(self) -> None:
-        """Load qlib DataFrames and register if available."""
-        self.qlib_dfs = {}
+    def _maybe_configure_gcs(self) -> None:
+        """Create or update DuckDB GCS secret if credentials are provided.
+
+        The service will look for `GCS_KEY_ID` and `GCS_KEY_SECRET` in the
+        environment.  If both are defined the method issues a
+        ``CREATE OR REPLACE SECRET`` statement using the active connection.
+        Any errors are logged but do not prevent the service from functioning
+        (queries against non-GCS tables still work).
+        """
+        key_id = os.getenv("GCS_KEY_ID")
+        key_secret = os.getenv("GCS_KEY_SECRET")
+        if not key_id or not key_secret:
+            return
+
         try:
-            dfs = load_qlib_dataframes()
-            for name, df in dfs.items():
-                if df.empty:
-                    logging.getLogger(__name__).warning(f"qlib dataframe {name} empty, skipping registration")
-                else:
-                    self.conn.register(name, df)
-                    self.qlib_dfs[name] = df
-                    logging.getLogger(__name__).info(
-                        f"Loaded qlib dataframe {name} with {len(df):,} rows and {len(df.columns):,} columns"
-                    )
+            # DuckDB requires the values to be quoted in the SQL string
+            self.conn.sql("""
+            INSTALL spatial; LOAD spatial;
+                    SET enable_object_cache = true;
+            """)
+
+            self.conn.execute(f"""
+            CREATE OR REPLACE SECRET gcs_secret (
+                TYPE GCS,
+                KEY_ID '{key_id}',
+                SECRET '{key_secret}'
+            );
+            """)
+            logging.getLogger(__name__).info("Configured GCS secret for DuckDB")
         except Exception as e:
-            # fail gracefully; we still have users/orders tables
-            logging.getLogger(__name__).warning(f"Failed to load qlib data: {e}")
+            logging.getLogger(__name__).warning(f"Failed to configure GCS secret: {e}")
     
     def execute_query(
         self,
@@ -117,8 +131,6 @@ class DuckDBService:
         schema_info = {}
         
         table_names = ["users", "orders"]
-        if hasattr(self, 'qlib_dfs'):
-            table_names.extend(list(self.qlib_dfs.keys()))
 
         for table_name in table_names:
             result = self.conn.execute(f"DESCRIBE {table_name}").df()
@@ -138,8 +150,6 @@ class DuckDBService:
             Dict with sample data
         """
         valid_tables = ["users", "orders"]
-        if hasattr(self, 'qlib_dfs'):
-            valid_tables.extend(list(self.qlib_dfs.keys()))
             
         if table_name not in valid_tables:
             return {

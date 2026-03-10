@@ -85,29 +85,17 @@ CREATE TABLE orders (
 
 ### Local Development
 
-#### Qlib data (optional)
+All data used by the service is seeded automatically; there is no
+external dependency required to run the server locally.
 
-If you wish to load market alpha features from Qlib, set the following
-environment variables in `.env.local` (see sample at the top of this
-file):
-
-```dotenv
-QLIB_DATA_DIR=/path/to/qlib_data
-QLIB_DATA_REGION=cn        # or "us"
-QLIB_START_DATE=20250601   # YYYYMMDD or YYYY-MM-DD
-QLIB_END_DATE=20251231
-QLIB_FREQ=day              # frequency for handler
-QLIB_ALPHA_TYPE=158        # "158" or "360"
-QLIB_INSTRUMENTS=all       # "all", "csi300", list, etc.
-```
-
-On application startup the configured data will be fetched, converted to a
-flat pandas DataFrame and automatically registered with DuckDB under the
-name `qlib`.  The `/schema` endpoint will include its schema if it was
-loaded.
-
-(This step requires `qlib` to be installed, which is included in the
-`uv pip install -e .` dependencies.)
+> **Google Cloud Storage**  
+> If you need to query Parquet files stored in GCS the service can
+> automatically configure DuckDB with the appropriate credentials.  Set
+> `GCS_KEY_ID` and `GCS_KEY_SECRET` (for a service account) in your
+> environment before startup and the server will issue a `CREATE OR
+> REPLACE SECRET` statement on its own connection.  Once configured you
+> may use `read_parquet('gcs://...')` and similar functions in your SQL
+> queries.
 
 
 #### Authentication
@@ -191,8 +179,7 @@ uv pip install -r requirements.txt
 
 #### Run Local Server
 
-If Qlib data is configured, it will already be registered and available
-for queries as the `qlib` table as soon as the server starts.
+
 
 
 With the environment active you can start the server directly,
@@ -253,12 +240,7 @@ curl http://localhost:8000/schema
 
 **Response:** Shows column names and types for all tables.
 
-> **Note:** if you have configured Qlib but query the `qlib` table and
-> receive no rows, the library loaded successfully but returned an empty
-> dataset.  This typically means the date range, instruments, or
-> region parameters (as set via `QLIB_*` environment variables) didn’t
-> match any data in your `QLIB_DATA_DIR`.  Double‑check that the data path
-> actually contains files and that the requested interval is covered.
+
 
 ### Get Table Sample
 
@@ -437,18 +419,6 @@ curl -X POST http://localhost:8000/query \
 ```
 
 ### 15. User Purchase History (Multiple Joins)
-
-(If Qlib data is loaded there will also be a `qlib` table.  Example:
-
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sql": "SELECT symbol, AVG(MA5) AS avg_ma5 FROM qlib GROUP BY symbol LIMIT 5",
-    "params": []
-  }'
-```
-)
 
 
 ```bash

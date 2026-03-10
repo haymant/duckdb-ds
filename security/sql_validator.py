@@ -138,6 +138,43 @@ def validate_parameters(params: List) -> Tuple[bool, str]:
     return True, "Parameters are valid"
 
 
+def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
+    """Rewrite ochlvf_* table names to parameterized GCS parquet scans.
+
+    When a table name beginning with ``ochlvf_`` is seen we replace the
+    literal reference with a ``read_parquet(?, hive_partitioning=true)``
+    expression and append the corresponding GCS path to the parameter list.
+    This keeps the path value out of the SQL string itself and allows DuckDB
+    to treat it as a bound parameter.  Multiple occurrences are supported and
+    each will add a new parameter in the order encountered.
+
+    The symbol portion is captured case‑insensitively and interpolated as
+    provided (``ochlvf_AAPL`` and ``ochlvf_aapl`` both work).
+
+    Example::
+        SELECT * FROM ochlvf_aapl =>
+          SELECT * FROM read_parquet(?, hive_partitioning=true)
+    """
+    pattern = r"\bochlvf_([a-zA-Z0-9]+)\b"
+
+    # ensure we have a mutable list to append to
+    new_params = [] if params is None else list(params)
+
+    def _replacer(match: re.Match) -> str:
+        symbol = match.group(1)
+        # GCS storage uses uppercase symbols; normalizing ensures the path
+        # matches whatever is actually stored.  We still record the original
+        # table name in SQL for readability, but the bound parameter uses
+        # uppercase so that both ``ochlvf_aapl`` and ``ochlvf_AAPL`` resolve
+        # to the same file set.
+        path = f"gcs://edge-lake/symbol={symbol.upper()}/*.parquet"
+        new_params.append(path)
+        return "read_parquet(?, hive_partitioning=true)"
+
+    new_sql = re.sub(pattern, _replacer, sql, flags=re.IGNORECASE)
+    return new_sql, new_params
+
+
 def prepare_query_for_duckdb(sql: str, params: List = None) -> Tuple[str, List]:
     """
     Prepare query for DuckDB execution with parameter substitution.
@@ -163,6 +200,9 @@ def prepare_query_for_duckdb(sql: str, params: List = None) -> Tuple[str, List]:
     else:
         params = []
     
+    # Rewrite any ochlvf_* table references to parameterized GCS parquet scans
+    sql, params = _rewrite_ochlvf(sql, params)
+
     # Count placeholders vs parameters
     placeholder_count = sql.count("?")
     if placeholder_count != len(params):
