@@ -46,6 +46,8 @@ def test_ochlvf_rewrite(monkeypatch):
     params_executed = executed.get('params', [])
 
     assert 'read_parquet' in sql_executed
+    # ensure the FROM keyword is still present when rewriting
+    assert 'FROM read_parquet' in sql_executed
     # path should have been turned into a parameter, not hard‑coded in SQL
     assert "symbol=AAPL" not in sql_executed
     assert sql_executed.count('?') >= 1
@@ -64,3 +66,24 @@ def test_ochlvf_rewrite(monkeypatch):
     assert 'read_parquet' in sql_executed
     assert 'ochlvf_aapl' not in sql_executed
     assert any('symbol=AAPL' in p for p in params_executed)
+
+    # generic ochlvf with multiple symbols in WHERE should combine paths
+    executed.clear()
+    svc.execute_query(
+        "SELECT * FROM ochlvf WHERE symbol = 'NVDA' OR symbol = 'TSLA'"
+    )
+    sql_executed = executed.get('sql', '')
+    params_executed = executed.get('params', [])
+    assert 'read_parquet' in sql_executed
+    # multi-path case should generate bracketed placeholders and two params
+    assert 'read_parquet([?,?]' in sql_executed
+    assert 'union_by_name=true' in sql_executed
+    assert len(params_executed) == 2
+    assert 'symbol=NVDA' in params_executed[0]
+    assert 'symbol=TSLA' in params_executed[1]
+
+    # generic ochlvf with LIKE pattern
+    executed.clear()
+    svc.execute_query("SELECT * FROM ochlvf WHERE symbol LIKE 'NV%' ")
+    params_executed = executed.get('params', [])
+    assert any('symbol=NV*' in p for p in params_executed)

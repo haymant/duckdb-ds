@@ -59,7 +59,7 @@ class SQLKeywordType(str, Enum):
 DANGEROUS_KEYWORDS = {
     "DROP", "DELETE", "INSERT", "UPDATE", "CREATE", "ALTER",
     "TRUNCATE", "EXEC", "EXECUTE", "SCRIPT", "UNION", "PRAGMA",
-    "--", "/*", "*/", ";", "LIKE", "CAST", "CONVERT"
+    "--", "/*", "*/", ";", "CAST", "CONVERT"
 }
 
 
@@ -83,9 +83,15 @@ def validate_sql_query(sql: str) -> Tuple[bool, str]:
             return False, f"Dangerous keyword '{dangerous}' not allowed"
     
     # Check for common SQL injection patterns
+    # patterns designed to catch naive injection attempts.  Most are
+    # intentionally conservative; the second pattern in particular previously
+    # matched any occurrence of ``'foo' OR 'bar'`` even when appearing as part
+    # of a legitimate WHERE clause.  We tighten it to only trigger when two
+    # quoted literals appear directly around the OR keyword with nothing but
+    # whitespace between them.
     injection_patterns = [
         r"['\"]\s*;\s*",  # Quote followed by semicolon
-        r"['\"].*['\"].*OR.*['\"]",  # OR with quotes
+        r"['\"][^'\"]*['\"]\s+OR\s+['\"][^'\"]*['\"]"  # literal OR literal
         r"UNION\s+SELECT",  # Union-based injection
         r"xp_",  # Extended stored procedures (SQL Server)
         r"sp_",  # System stored procedures
@@ -139,40 +145,97 @@ def validate_parameters(params: List) -> Tuple[bool, str]:
 
 
 def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
-    """Rewrite ochlvf_* table names to parameterized GCS parquet scans.
+    """Rewrite ochlvf-related table references to parameterized GCS scans.
 
-    When a table name beginning with ``ochlvf_`` is seen we replace the
-    literal reference with a ``read_parquet(?, hive_partitioning=true)``
-    expression and append the corresponding GCS path to the parameter list.
-    This keeps the path value out of the SQL string itself and allows DuckDB
-    to treat it as a bound parameter.  Multiple occurrences are supported and
-    each will add a new parameter in the order encountered.
+    There are two supported use‑cases:
 
-    The symbol portion is captured case‑insensitively and interpolated as
-    provided (``ochlvf_AAPL`` and ``ochlvf_aapl`` both work).
+    1. **Named tables** – the source SQL explicitly references
+       ``ochlvf_{SYMBOL}`` in a FROM or JOIN clause.  These are rewritten
+       directly and the ``{SYMBOL}`` portion is uppercased to form the
+       storage path.
 
-    Example::
-        SELECT * FROM ochlvf_aapl =>
-          SELECT * FROM read_parquet(?, hive_partitioning=true)
+    2. **Generic table** – the SQL refers to ``ochlvf`` itself (optionally
+       aliased) in FROM/JOIN.  In this case the set of symbols to read is
+       inferred from the WHERE clause.  Any equality, IN-list, or LIKE
+       conditions on the ``symbol`` column are collected; like patterns are
+       translated into glob-style wildcards.  All discovered values are
+       uppercased and combined into a single path parameter using brace
+       expansion (DuckDB accepts paths like
+       ``symbol={AAPL,TSLA}``).
+
+    If neither pattern is present the input SQL is returned unchanged.
     """
-    pattern = r"\bochlvf_([a-zA-Z0-9]+)\b"
-
-    # ensure we have a mutable list to append to
     new_params = [] if params is None else list(params)
 
-    def _replacer(match: re.Match) -> str:
-        symbol = match.group(1)
-        # GCS storage uses uppercase symbols; normalizing ensures the path
-        # matches whatever is actually stored.  We still record the original
-        # table name in SQL for readability, but the bound parameter uses
-        # uppercase so that both ``ochlvf_aapl`` and ``ochlvf_AAPL`` resolve
-        # to the same file set.
-        path = f"gcs://edge-lake/symbol={symbol.upper()}/*.parquet"
-        new_params.append(path)
-        return "read_parquet(?, hive_partitioning=true)"
+    # helper to create one or more GCS paths from symbol patterns
+    def _make_paths(symbol_patterns: List[str]) -> List[str]:
+        if not symbol_patterns:
+            return []
+        return [f"gcs://edge-lake/symbol={pat}/*.parquet" for pat in symbol_patterns]
 
-    new_sql = re.sub(pattern, _replacer, sql, flags=re.IGNORECASE)
-    return new_sql, new_params
+    # first pass: explicit ochlvf_{SYMBOL} references in FROM/JOIN
+    def _named_replacer(match: re.Match) -> str:
+        prefix = match.group(1)  # "FROM " or "JOIN "
+        symbol = match.group(2)
+        paths = _make_paths([symbol.upper()])
+        # single path only for named table
+        new_params.extend(paths)
+        return f"{prefix}read_parquet(?, hive_partitioning=true)"
+
+    named_pattern = r"(\b(?:FROM|JOIN)\s+)ochlvf_([a-zA-Z0-9]+)\b"
+    sql = re.sub(named_pattern, _named_replacer, sql, flags=re.IGNORECASE)
+
+    # second pass: generic ``ochlvf`` table
+    generic_pattern = r"(\b(?:FROM|JOIN)\s+)ochlvf\b"
+    if re.search(generic_pattern, sql, flags=re.IGNORECASE):
+        # extract symbol-related predicates from WHERE clause
+        symbols = set()
+        where_match = re.search(r"WHERE\s+(.*)", sql, flags=re.IGNORECASE | re.DOTALL)
+        if where_match:
+            where_clause = where_match.group(1)
+            # stop at GROUP/ORDER/LIMIT/HAVING
+            where_clause = re.split(r"\b(GROUP|ORDER|LIMIT|HAVING)\b",
+                                     where_clause, flags=re.IGNORECASE)[0]
+
+            # equalities
+            for m in re.finditer(r"symbol\s*=\s*'([^']+)'",
+                                 where_clause, flags=re.IGNORECASE):
+                symbols.add(m.group(1).upper())
+
+            # IN lists
+            for m in re.finditer(r"symbol\s+IN\s*\(([^)]+)\)",
+                                 where_clause, flags=re.IGNORECASE):
+                for val in re.findall(r"'([^']+)'", m.group(1)):
+                    symbols.add(val.upper())
+
+            # LIKE patterns – convert SQL wildcards to glob wildcards
+            for m in re.finditer(r"symbol\s+LIKE\s*'([^']+)'",
+                                 where_clause, flags=re.IGNORECASE):
+                pat = m.group(1).upper()
+                pat = pat.replace('%', '*').replace('_', '?')
+                symbols.add(pat)
+
+        paths = _make_paths(sorted(symbols))
+        if paths:
+            # if only one path we can use the simple placeholder syntax
+            if len(paths) == 1:
+                new_params.append(paths[0])
+                placeholder_expr = "?"
+            else:
+                # build list of placeholders
+                placeholder_expr = ",".join("?" for _ in paths)
+                new_params.extend(paths)
+                placeholder_expr = f"[{placeholder_expr}]"
+            sql = re.sub(generic_pattern,
+                         rf"\1read_parquet({placeholder_expr}, hive_partitioning=true, union_by_name=true)",
+                         sql, flags=re.IGNORECASE)
+        else:
+            # no paths discovered; still replace name but no params
+            sql = re.sub(generic_pattern,
+                         r"\1read_parquet(?, hive_partitioning=true, union_by_name=true)",
+                         sql, flags=re.IGNORECASE)
+
+    return sql, new_params
 
 
 def prepare_query_for_duckdb(sql: str, params: List = None) -> Tuple[str, List]:

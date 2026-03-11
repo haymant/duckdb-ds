@@ -55,7 +55,7 @@ class DuckDBService:
             # DuckDB requires the values to be quoted in the SQL string
             self.conn.sql("""
             INSTALL spatial; LOAD spatial;
-                    SET enable_object_cache = true;
+                    SET enable_object_cache = true;SET home_directory='/tmp';
             """)
 
             self.conn.execute(f"""
