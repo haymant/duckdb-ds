@@ -125,7 +125,7 @@ specification without a token.
 
 
 #### Prerequisites
-- Python 3.9+ (ideally 3.11)
+- Python 3.12+ 
 - `uv` package manager ([install uv](https://docs.astral.sh/uv/getting-started/installation/))
 
 #### Setup

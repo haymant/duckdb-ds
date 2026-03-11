@@ -7,6 +7,8 @@ import re
 from typing import List, Tuple
 from enum import Enum
 
+from security.sql_parser import extract_symbol_filters, extract_table_refs
+
 
 class SQLKeywordType(str, Enum):
     """Safe SQL keywords allowed in queries."""
@@ -188,32 +190,12 @@ def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
     # second pass: generic ``ochlvf`` table
     generic_pattern = r"(\b(?:FROM|JOIN)\s+)ochlvf\b"
     if re.search(generic_pattern, sql, flags=re.IGNORECASE):
-        # extract symbol-related predicates from WHERE clause
-        symbols = set()
-        where_match = re.search(r"WHERE\s+(.*)", sql, flags=re.IGNORECASE | re.DOTALL)
-        if where_match:
-            where_clause = where_match.group(1)
-            # stop at GROUP/ORDER/LIMIT/HAVING
-            where_clause = re.split(r"\b(GROUP|ORDER|LIMIT|HAVING)\b",
-                                     where_clause, flags=re.IGNORECASE)[0]
+        ochlvf_aliases = []
+        for table_ref in extract_table_refs(sql):
+            if table_ref.table_name.lower() == "ochlvf":
+                ochlvf_aliases.extend([item for item in (table_ref.alias, table_ref.table_name) if item])
 
-            # equalities
-            for m in re.finditer(r"symbol\s*=\s*'([^']+)'",
-                                 where_clause, flags=re.IGNORECASE):
-                symbols.add(m.group(1).upper())
-
-            # IN lists
-            for m in re.finditer(r"symbol\s+IN\s*\(([^)]+)\)",
-                                 where_clause, flags=re.IGNORECASE):
-                for val in re.findall(r"'([^']+)'", m.group(1)):
-                    symbols.add(val.upper())
-
-            # LIKE patterns – convert SQL wildcards to glob wildcards
-            for m in re.finditer(r"symbol\s+LIKE\s*'([^']+)'",
-                                 where_clause, flags=re.IGNORECASE):
-                pat = m.group(1).upper()
-                pat = pat.replace('%', '*').replace('_', '?')
-                symbols.add(pat)
+        symbols = extract_symbol_filters(sql, aliases=ochlvf_aliases or None)
 
         paths = _make_paths(sorted(symbols))
         if paths:

@@ -3,7 +3,7 @@ DuckDB service for executing SQL queries on DataFrames.
 Handles connection, table registration, and query execution.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 import logging
 import duckdb
 import pandas as pd
@@ -12,7 +12,10 @@ import fsspec
 import gcsfs
 
 from data.seed import create_dummy_users, create_dummy_orders
+from security.sql_features import find_alpha_table_refs, infer_alpha_request
 from security.sql_validator import prepare_query_for_duckdb
+from services.data_query import DataQueryService
+from services.feature_manager import FeatureManager
 
 
 class DuckDBService:
@@ -22,6 +25,8 @@ class DuckDBService:
         """Initialize DuckDB service with in-memory database and seed data."""
         # Create in-memory DuckDB connection
         self.conn = duckdb.connect(":memory:")
+        self.dynamic_tables: Set[str] = set()
+        self.data_query_service = DataQueryService(self.conn)
         
         # Load dummy data
         self.users_df = create_dummy_users()
@@ -31,6 +36,18 @@ class DuckDBService:
         self._register_tables()
         # configure GCS credentials if environment variables are set
         self._maybe_configure_gcs()
+        self.feature_manager = FeatureManager(
+            self.conn,
+            config={
+                "provider_uri": os.getenv("ALPHA_PROVIDER_URI"),
+                "region": os.getenv("ALPHA_REGION") or "REG_US",
+                "freq": os.getenv("ALPHA_FREQ") or "day",
+                "allow_full_scan": (os.getenv("ALPHA_ALLOW_FULL_SCAN") or "false").lower() == "true",
+                "fit_start_time": os.getenv("ALPHA_FIT_START_TIME"),
+                "fit_end_time": os.getenv("ALPHA_FIT_END_TIME"),
+            },
+            data_query_service=self.data_query_service,
+        )
     
     def _register_tables(self) -> None:
         """Register DataFrames as DuckDB tables."""
@@ -91,6 +108,7 @@ class DuckDBService:
         try:
             # Validate and prepare query
             prepared_sql, prepared_params = prepare_query_for_duckdb(sql, params or [])
+            self._prepare_alpha_tables(sql)
             
             # Execute query with parameters
             result = self.conn.execute(prepared_sql, parameters=prepared_params)
@@ -105,7 +123,6 @@ class DuckDBService:
                 "row_count": len(df_result),
                 "data": df_result.to_dict(orient="records"),
             }
-            
         except ValueError as e:
             # SQL injection prevention errors
             return {
@@ -120,6 +137,15 @@ class DuckDBService:
                 "error": f"Query execution error: {str(e)}",
                 "error_type": "execution"
             }
+
+    def query_dataframe(self, sql: str, params: Optional[List[Any]] = None) -> pd.DataFrame:
+        return self.data_query_service.query_dataframe(sql, params)
+
+    def _prepare_alpha_tables(self, sql: str) -> None:
+        for table_ref in find_alpha_table_refs(sql):
+            request = infer_alpha_request(sql, table_ref)
+            self.feature_manager.ensure_registered(request)
+            self.dynamic_tables.add(request.sql_table_name)
     
     def get_schema(self) -> Dict[str, List[Dict[str, str]]]:
         """
@@ -130,11 +156,14 @@ class DuckDBService:
         """
         schema_info = {}
         
-        table_names = ["users", "orders"]
+        table_names = ["users", "orders", *sorted(self.dynamic_tables)]
 
         for table_name in table_names:
-            result = self.conn.execute(f"DESCRIBE {table_name}").df()
-            schema_info[table_name] = result.to_dict(orient="records")
+            try:
+                result = self.conn.execute(f"DESCRIBE {table_name}").df()
+                schema_info[table_name] = result.to_dict(orient="records")
+            except Exception:
+                continue
         
         return schema_info
     
@@ -149,7 +178,7 @@ class DuckDBService:
         Returns:
             Dict with sample data
         """
-        valid_tables = ["users", "orders"]
+        valid_tables = ["users", "orders", *sorted(self.dynamic_tables)]
             
         if table_name not in valid_tables:
             return {
