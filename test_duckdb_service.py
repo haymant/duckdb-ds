@@ -8,6 +8,8 @@ from security.sql_features import find_alpha_table_refs, infer_alpha_request
 from security.sql_parser import extract_datetime_range, extract_symbol_filters, extract_table_refs
 from services.feature_manager import FeatureManager
 import main as api_main
+import pytest
+from pathlib import Path
 
 
 class DummyAlphaHandler:
@@ -163,6 +165,60 @@ def test_ochlvf_rewrite(monkeypatch):
     assert any('symbol=NV*' in p for p in params_executed)
 
 
+def test_execute_query_serializes_timestamps(monkeypatch):
+    # ensure execute_query converts pandas Timestamp to plain strings
+    svc = DuckDBService()
+
+    class FakeResult:
+        def __init__(self):
+            self._df = pd.DataFrame([
+                {"date": pd.Timestamp("2026-03-01"), "value": 1},
+            ])
+        def df(self):
+            return self._df
+
+    class FakeConn:
+        def execute(self, sql, parameters=None):
+            return FakeResult()
+
+    monkeypatch.setattr(svc, "conn", FakeConn())
+    res = svc.execute_query("select date, value from ochlvf", params=None)
+    assert res["success"] is True
+    # row value should be a string not Timestamp
+    assert isinstance(res["rows"][0][0], str)
+    assert isinstance(res["data"][0]["date"], str)
+
+
+def test_query_endpoint_handles_timestamp_rows(monkeypatch):
+    api_main._load_tokens = lambda: ["test-token"]
+    svc = api_main.db_service
+
+    # patch the underlying connection to return a timestamp-containing row
+    class FakeResult:
+        def __init__(self):
+            self._df = pd.DataFrame([{"date": pd.Timestamp("2026-03-02"), "val": 42}])
+        def df(self):
+            return self._df
+
+    class FakeConn:
+        def execute(self, sql, parameters=None):
+            return FakeResult()
+
+    monkeypatch.setattr(svc, "conn", FakeConn())
+
+    client = TestClient(api_main.app)
+    response = client.post(
+        "/query",
+        json={"sql": "select date,val from ochlvf"},
+        headers={"Authorization": "Bearer test-token"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert isinstance(payload["rows"][0][0], str)
+    assert isinstance(payload["data"][0]["date"], str)
+
+
 def test_sql_parser_extracts_table_refs_and_filters():
     sql = (
         "SELECT o.symbol, a.MA5 FROM ochlvf_AAPL o "
@@ -230,13 +286,28 @@ def test_feature_manager_uses_duck_server_data_query_when_provider_uri_missing()
     assert "AAPL" in sql
 
 
-def test_feature_manager_real_query_no_placeholder_mismatch():
+def test_feature_manager_real_query_no_placeholder_mismatch(tmp_path):
     # this regression test exercises the real DataQueryService, which uses
     # prepare_query_for_duckdb and therefore performs the ochlvf rewrite.
     # prior to the fix the internal provider query would produce two '?' but
     # only one parameter (symbol), leading to a validation error bubbled to
     # the outer execute_query call.  verify that no exception is thrown and
     # some data is returned.
+
+    # ensure tests never attempt to hit real GCS buckets; clear any
+    # credentials that might have been loaded from .env.local and redirect
+    # ochlvf paths to a temporary local dataset.
+    import os
+    for key in ("GCS_KEY_ID", "GCS_KEY_SECRET", "GCS_SC_JSON", "GCS_BUCKET_NAME"):
+        os.environ.pop(key, None)
+    os.environ["MARKET_DATA_ROOT"] = str(tmp_path / "market-data")
+    # create a minimal parquet file for symbol AAPL so the read_parquet call
+    # in the feature handler succeeds
+    import pandas as pd
+    data_dir = tmp_path / "market-data" / "symbol=AAPL"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame({"symbol": ["AAPL"], "date": [pd.Timestamp("2026-01-01")]})
+    df.to_parquet(data_dir / "dummy.parquet")
 
     svc = DuckDBService()
     manager = FeatureManager(
@@ -365,3 +436,466 @@ def test_query_endpoint_accepts_alpha_payload(monkeypatch):
     payload = response.json()
     assert payload["success"] is True
     assert payload["row_count"] >= 1
+
+
+def test_duckdb_service_registers_market_data_views(tmp_path, monkeypatch):
+    root = tmp_path / "market-data"
+    (root / "feature-csv" / "fx").mkdir(parents=True)
+    (root / "feature-csv" / "fx" / "EURUSD_X.csv").write_text(
+        "symbol,date,close\nEURUSD=X,2026-03-10,1.09\n"
+    )
+
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(root))
+    svc = DuckDBService()
+
+    result = svc.execute_query("SELECT symbol, close FROM market_fx")
+    assert result["success"] is True
+    assert result["row_count"] == 1
+    assert result["data"][0]["symbol"] == "EURUSD=X"
+
+    schema = svc.get_schema()
+    assert "market_fx" in schema
+
+
+def test_query_fails_if_market_data_not_synced(monkeypatch, tmp_path):
+    """If the market-data root is empty the service should return a clear
+    validation error instead of a generic DuckDB catalog exception.
+    """
+    # ensure the default root is something that exists but has no files
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(tmp_path))
+    svc = DuckDBService()
+    result = svc.execute_query("SELECT symbol FROM market_fx")
+    assert result["success"] is False
+    assert result["error_type"] == "validation"
+    assert "Market data 'fx' is not available" in result["error"]
+
+
+def test_market_data_catalog_endpoint(monkeypatch):
+    api_main._load_tokens = lambda: ["test-token"]
+    monkeypatch.setattr(
+        api_main.db_service.market_data_service,
+        "get_catalog",
+        lambda: [{"asset_type": "fx", "table_name": "market_fx", "available": True}],
+    )
+    client = TestClient(api_main.app)
+
+    response = client.get(
+        "/market-data/catalog",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["items"][0]["table_name"] == "market_fx"
+
+
+def test_market_data_sync_endpoint(monkeypatch):
+    api_main._load_tokens = lambda: ["test-token"]
+
+    monkeypatch.setattr(
+        api_main.db_service.market_data_service,
+        "sync_market_data",
+        lambda *args, **kwargs: {
+            "asset_type": "fx",
+            "table_name": "market_fx",
+            "generated_files": ["/tmp/market-data/feature-csv/fx/EURUSD_X.csv"],
+            "registered_tables": ["market_fx"],
+            "warnings": ["some warning"],
+        },
+    )
+    client = TestClient(api_main.app)
+
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "fx", "symbols": ["EURUSD=X"], "start": "2026-03-01", "end": "2026-03-10"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["result"]["table_name"] == "market_fx"
+    assert payload["result"].get("warnings") == ["some warning"]
+
+
+def test_sync_returns_error_on_download_failure(monkeypatch):
+    api_main._load_tokens = lambda: ["test-token"]
+    # patch the underlying featureSQL runner to throw FileNotFoundError
+    import services.market_data_service as mdmod
+    class DummyRun:
+        def download(self, *args, **kwargs):
+            raise FileNotFoundError("no CSV files found")
+    monkeypatch.setattr(
+        mdmod,
+        "_ensure_feature_sql_importable",
+        lambda: type("M", (), {"Run": DummyRun}),
+    )
+    # clear any previously cached module so our patch takes effect
+    api_main.db_service.market_data_service._feature_sql = None
+
+    client = TestClient(api_main.app)
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "option"},
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["detail"] == "no CSV files found"
+
+
+def test_sync_returns_error_on_missing_gcs_key(monkeypatch):
+    """A KeyError originating from the storage layer should become a 400.
+    """
+    api_main._load_tokens = lambda: ["test-token"]
+    # monkeypatch the runner so download raises KeyError (simulating
+    # malformed credentials deep in the gcs client).  Our service should
+    # catch it and report as a ValueError.
+    import services.market_data_service as mdmod
+    class DummyRun:
+        def download(self, *args, **kwargs):
+            raise KeyError("refresh_token")
+    monkeypatch.setattr(
+        mdmod,
+        "_ensure_feature_sql_importable",
+        lambda: type("M", (), {"Run": DummyRun}),
+    )
+    api_main.db_service.market_data_service._feature_sql = None
+
+    client = TestClient(api_main.app)
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "equity"},
+    )
+    assert response.status_code == 400
+    assert "refresh_token" in response.json().get("detail", "")
+
+
+def test_sync_skips_analytics_on_missing_data(monkeypatch):
+    """Even if the main download succeeds, the analytics step may have no
+    data and should not cause a 500.  This test simulates that by hooking the
+    runner to raise FileNotFoundError during the IR curve and vol surface
+    calls while leaving the initial download working.
+    """
+    api_main._load_tokens = lambda: ["test-token"]
+    class DummyRun:
+        def download(self, *args, **kwargs):
+            # do nothing, pretend csvs exist
+            return
+        def boost_ir_curve(self, *args, **kwargs):
+            raise FileNotFoundError("no CSV files found under /tmp/duck-server-market-data/ir")
+        def calibrate_vol_surface(self, *args, **kwargs):
+            raise FileNotFoundError("no CSV files found under /tmp/duck-server-market-data/option-chain")
+    import services.market_data_service as mdmod
+    monkeypatch.setattr(
+        mdmod,
+        "_ensure_feature_sql_importable",
+        lambda: type("M", (), {"Run": DummyRun}),
+    )
+    svc = api_main.db_service.market_data_service
+    svc._feature_sql = None
+
+    client = TestClient(api_main.app)
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "option"},
+    )
+    # should still be 200 although analytics were skipped
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["result"]["analytics_files"] == []
+
+
+def test_sync_market_data_passes_asset_type_to_runner(monkeypatch):
+    """Ensure `sync_market_data` invokes the featureSQL runner with the
+    requested asset_type argument (regression test for upstream package
+    mismatches).
+    """
+    dummy = {}
+
+    class DummyRun:
+        def __init__(self):
+            pass
+
+        def download(self, *args, **kwargs):
+            dummy["called"] = True
+            dummy["kwargs"] = kwargs
+
+    # monkeypatch the module-level helper so sync_market_data uses our stub
+    import services.market_data_service as mdmod
+    monkeypatch.setattr(
+        mdmod,
+        "_ensure_feature_sql_importable",
+        lambda: type("M", (), {"Run": DummyRun}),
+    )
+    svc = api_main.db_service.market_data_service
+    svc._feature_sql = None  # clear cache so patched module is loaded
+
+    # perform the sync, which should call our dummy runner
+    # set a bucket name so the service can fill in the path
+    monkeypatch.setenv("GCS_BUCKET_NAME", "bucket123")
+    svc.sync_market_data("fx", symbols=["EURUSD=X"])
+
+    assert dummy.get("called")
+    assert dummy["kwargs"].get("asset_type") == "fx"
+    # ensure default store type and path behaviour
+    assert dummy["kwargs"].get("store_type") == "gcs"
+    assert dummy["kwargs"].get("data_path") == "bucket123"
+
+
+def test_api_default_store_type_is_gcs(monkeypatch):
+    """POSTing to the sync endpoint without a store_type should still use
+    GCS.  We likewise verify that the data_path is pulled from the
+    environment when missing."""
+    dummy = {}
+    class DummyRun:
+        def download(self, *args, **kwargs):
+            dummy["kwargs"] = kwargs
+    import services.market_data_service as mdmod
+    monkeypatch.setattr(
+        mdmod,
+        "_ensure_feature_sql_importable",
+        lambda: type("M", (), {"Run": DummyRun}),
+    )
+    svc = api_main.db_service.market_data_service
+    svc._feature_sql = None
+
+    api_main._load_tokens = lambda: ["test-token"]
+    client = TestClient(api_main.app)
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "equity"},
+    )
+    assert response.status_code == 200
+    assert dummy.get("kwargs", {}).get("store_type") == "gcs"
+
+    dummy.clear()
+    monkeypatch.setenv("GCS_BUCKET_NAME", "bucket-env")
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "equity"},
+    )
+    assert response.status_code == 200
+    assert dummy.get("kwargs", {}).get("data_path") == "bucket-env"
+
+
+def test_sync_market_data_propagates_runner_warnings(monkeypatch):
+    """Any warnings returned by featureSQL downloader should appear in the result."""
+    api_main._load_tokens = lambda: ["test-token"]
+    class DummyRun:
+        def download(self, *args, **kwargs):
+            return {"warnings": ["foo"]}
+    import services.market_data_service as mdmod
+    monkeypatch.setattr(
+        mdmod,
+        "_ensure_feature_sql_importable",
+        lambda: type("M", (), {"Run": DummyRun}),
+    )
+    svc = api_main.db_service.market_data_service
+    svc._feature_sql = None
+
+    client = TestClient(api_main.app)
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "equity"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["result"].get("warnings") == ["foo"]
+
+
+def test_sync_parquet_generation_for_gcs(monkeypatch):
+    """When syncing with `store_type=gcs` the service should invoke the
+    runner's `dump_parquet` helper and propagate any errors as warnings.
+    """
+    api_main._load_tokens = lambda: ["test-token"]
+    calls = {}
+    class DummyRun:
+        def download(self, *args, **kwargs):
+            return {}  # no warnings
+        def dump_parquet(self, *args, **kwargs):
+            calls['dump'] = kwargs
+            # simulate failure to trigger warning
+            raise RuntimeError("upload failed")
+        # stub parser used by service logic
+        def _parse_symbols_arg(self, symbols, asset_type=None):
+            # mimic Run._parse_symbols_arg behaviour minimally
+            if symbols is None:
+                return None
+            if isinstance(symbols, (list, tuple)):
+                return list(symbols)
+            return [s for s in str(symbols).split(",") if s]
+    import services.market_data_service as mdmod
+    monkeypatch.setattr(
+        mdmod,
+        "_ensure_feature_sql_importable",
+        lambda: type("M", (), {"Run": DummyRun}),
+    )
+    svc = api_main.db_service.market_data_service
+    svc._feature_sql = None
+
+    client = TestClient(api_main.app)
+    response = client.post(
+        "/market-data/sync",
+        headers={"Authorization": "Bearer test-token"},
+        json={"asset_type": "equity", "symbols": ["AAPL"]},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert 'warnings' in payload['result']
+    assert any('upload failed' in w for w in payload['result']['warnings'])
+    assert 'dump' in calls
+    assert calls['dump'].get('upload_gcs') is True
+    # gcs_bucket should be set to the base path used by the service (either
+    # bucket name or MARKET_DATA_ROOT)
+    assert calls['dump'].get('gcs_bucket')
+    # even though dump_parquet failed we should still return generated_files
+    assert isinstance(payload['result'].get('generated_files'), list)
+
+
+def test_ensure_feature_sql_importable_prefers_local():
+    """The import helper should return the copy of `featureSQL` from the
+    repository rather than any installed package.
+    """
+    import services.market_data_service as mdmod
+    mod = mdmod._ensure_feature_sql_importable()
+    from pathlib import Path
+
+    # The returned module should come from the workspace tree rather than
+    # site-packages.  We simply verify that the file path contains the
+    # repository's `featureSQL` directory and does not reference 'site-packages'.
+    path_str = str(Path(mod.__file__).resolve())
+    assert "/featureSQL/featureSQL" in path_str
+    assert "site-packages" not in path_str
+
+
+def test_sync_market_data_invalid_type():
+    """Requests for unsupported market data types should raise ValueError."""
+    svc = api_main.db_service.market_data_service
+    with pytest.raises(ValueError):
+        svc.sync_market_data("bogus")
+
+
+def test_feature_sql_module_is_cached(monkeypatch):
+    """Accessing ``feature_sql`` twice should reuse the cached module."""
+    import services.market_data_service as mdmod
+    sentinel = object()
+    monkeypatch.setattr(mdmod, "_ensure_feature_sql_importable", lambda: sentinel)
+    svc = api_main.db_service.market_data_service
+    svc._feature_sql = None
+
+    first = svc.feature_sql
+    assert first is sentinel
+    # change helper so that a second access would return something else
+    monkeypatch.setattr(mdmod, "_ensure_feature_sql_importable", lambda: None)
+    second = svc.feature_sql
+    assert second is sentinel  # still the original cached object
+
+
+def test_execute_query_serializes_nat_and_nan():
+    """Rows containing pandas NaT or numpy NaN should round-trip as nulls.
+    """
+    svc = api_main.db_service
+    # register a small table with NaT/NaN values
+    import pandas as pd
+    df = pd.DataFrame({"a": [pd.NaT], "b": [float("nan")]})
+    svc.conn.register("foo", df)
+    result = svc.execute_query("SELECT * FROM foo")
+    assert result["success"] is True
+    # check python-level extraction
+    assert result["rows"][0] == [None, None]
+    assert result["data"][0]["a"] is None
+    assert result["data"][0]["b"] is None
+
+    # constructing the pydantic response should not raise
+    from main import QueryResponse
+    resp = QueryResponse(
+        success=True,
+        columns=result["columns"],
+        rows=result["rows"],
+        row_count=result["row_count"],
+        data=result["data"],
+    )
+    # ensure json() works
+    _ = resp.json()
+
+
+def test_execute_query_handles_plain_floats():
+    """Ensure float values are returned intact and do not raise serialization errors.
+    """
+    svc = api_main.db_service
+    # create simple table with a float column
+    import pandas as pd
+    df = pd.DataFrame({"x": [1.23, 4.56]})
+    svc.conn.register("bar", df)
+    result = svc.execute_query("SELECT * FROM bar")
+    assert result["success"] is True
+    assert result["rows"] == [[1.23], [4.56]]
+    # response object should build cleanly
+    from main import QueryResponse
+    resp = QueryResponse(
+        success=True,
+        columns=result["columns"],
+        rows=result["rows"],
+        row_count=result["row_count"],
+        data=result["data"],
+    )
+    _ = resp.json()
+
+
+def test_ensure_feature_sql_importable_falls_back(monkeypatch):
+    """When no local checkout exists we still call import_module and return whatever it gives."""
+    import services.market_data_service as mdmod
+    # make candidate check always false
+    orig_exists = Path.exists
+    def fake_exists(self):
+        if self.name == "featureSQL":
+            return False
+        return orig_exists(self)
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    dummy = object()
+    monkeypatch.setattr(mdmod.importlib, "import_module", lambda name: dummy)
+
+    assert mdmod._ensure_feature_sql_importable() is dummy
+
+
+def test_sync_market_data_files_and_analytics(monkeypatch, tmp_path):
+    """``sync_market_data`` should return generated and analytics paths when using fs store."""
+    class DummyRun:
+        def download(self, *args, **kwargs):
+            return {}
+        def boost_ir_curve(self, data_path, output_path, store_type):
+            # create the expected output file when running on filesystem
+            if store_type == "fs":
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(output_path).write_text("")
+        def calibrate_vol_surface(self, data_path, output_path, store_type):
+            if store_type == "fs":
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(output_path).write_text("")
+
+    import services.market_data_service as mdmod
+    monkeypatch.setattr(mdmod, "_ensure_feature_sql_importable", lambda: type("M", (), {"Run": DummyRun}))
+    svc = api_main.db_service.market_data_service
+    svc._feature_sql = None
+
+    # stub out file resolution to avoid touching the real filesystem
+    monkeypatch.setattr(svc, "_resolve_local_files", lambda definition, root: [f"{root}/{definition.table_name}.csv"])
+    monkeypatch.setenv("MARKET_DATA_ROOT", str(tmp_path))
+    # avoid creating real DuckDB views during this unit test
+    monkeypatch.setattr(svc, "register_all_views", lambda root=None: None)
+
+    result = svc.sync_market_data("ir", store_type="fs")
+    base = str(tmp_path)
+    assert result["store_type"] == "fs"
+    # generated files should come from our fake resolver
+    assert result["generated_files"] == [f"{base}/market_ir.csv"]
+    # analytics path should be returned as well
+    assert result["analytics_files"] == [f"{base}/analytics/ir_curve.csv"]

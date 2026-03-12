@@ -3,6 +3,7 @@ SQL injection prevention and validation module.
 Implements parameterized queries and SQL keyword validation.
 """
 
+import os
 import re
 from typing import List, Tuple
 from enum import Enum
@@ -173,7 +174,14 @@ def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
     def _make_paths(symbol_patterns: List[str]) -> List[str]:
         if not symbol_patterns:
             return []
-        return [f"gcs://edge-lake/symbol={pat}/*.parquet" for pat in symbol_patterns]
+        # allow tests or local dev to override the storage root
+        bucket = os.getenv("GCS_BUCKET_NAME")
+        if bucket:
+            prefix = f"gcs://{bucket}"
+        else:
+            # fallback to local filesystem root (used for fs-based tests)
+            prefix = os.getenv("MARKET_DATA_ROOT") or "/tmp/duck-server-market-data"
+        return [f"{prefix}/symbol={pat}/*.parquet" for pat in symbol_patterns]
 
     # first pass: explicit ochlvf_{SYMBOL} references in FROM/JOIN
     def _named_replacer(match: re.Match) -> str:
@@ -212,10 +220,10 @@ def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
                          rf"\1read_parquet({placeholder_expr}, hive_partitioning=true, union_by_name=true)",
                          sql, flags=re.IGNORECASE)
         else:
-            # no paths discovered; still replace name but no params
-            sql = re.sub(generic_pattern,
-                         r"\1read_parquet(?, hive_partitioning=true, union_by_name=true)",
-                         sql, flags=re.IGNORECASE)
+            # no paths discovered; leave the original table reference in place
+            # (query will simply return no rows rather than generating a broken
+            # parameterized expression).
+            pass
 
     return sql, new_params
 

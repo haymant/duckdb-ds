@@ -93,12 +93,12 @@ class QueryRequest(BaseModel):
     sql: str = Field(
         ...,
         description="SQL SELECT query with ? placeholders for parameters",
-        example="SELECT * FROM users WHERE country = ?"
+        json_schema_extra={"example": "SELECT * FROM users WHERE country = ?"},
     )
     params: Optional[List[Any]] = Field(
         None,
         description="List of parameters to bind to ? placeholders",
-        example=["USA"]
+        json_schema_extra={"example": ["USA"]},
     )
 
 
@@ -128,6 +128,43 @@ class SchemaResponse(BaseModel):
     """Response body for schema endpoint."""
     success: bool
     schema_info: dict  # renamed from `schema` to avoid BaseModel warning
+
+
+class MarketDataSyncRequest(BaseModel):
+    asset_type: str = Field(..., description="Market data type such as equity, fx, ir, vol, correlation, option")
+    symbols: Optional[List[str] | str] = Field(None, description="Symbols or pair identifiers to sync")
+    start: Optional[str] = Field(None, description="Inclusive start date")
+    end: Optional[str] = Field(None, description="Inclusive end date")
+    mode: str = Field("history", description="history or spot")
+    out_format: str = Field("csv", description="csv, parquet, or bin depending on asset type")
+    store_type: str = Field(
+        "gcs",
+        description=(
+            "fs or gcs; defaults to gcs to keep buckets optimised. "
+            "If you are running locally without GCS credentials you can set this to 'fs', "
+            "otherwise a malformed GCS JSON will produce a 400 complaining about a missing key."
+        ),
+    )
+    data_path: Optional[str] = Field(
+        None,
+        description="Local root or GCS bucket/prefix (bucket name when using gcs)",
+    )
+    correlation_window: int = Field(20, description="Rolling window for derived correlations")
+    generate_ir_curve: bool = Field(True, description="Whether IR sync also writes ir_curve.csv")
+    generate_vol_surface: bool = Field(True, description="Whether option sync also writes vol_surface.csv")
+
+
+class MarketDataCatalogResponse(BaseModel):
+    success: bool
+    items: List[dict]
+
+
+class MarketDataSyncResponse(BaseModel):
+    success: bool
+    result: dict
+    # ``result`` may contain a ``warnings`` list when the downloader reported
+    # non-fatal issues (e.g. rate limiting or missing symbols).  The UI should
+    # display these messages to help users understand why no files appeared.
 
 
 # Routes
@@ -228,6 +265,43 @@ async def get_schema():
         )
 
 
+@app.get("/market-data/catalog", response_model=MarketDataCatalogResponse)
+async def get_market_data_catalog():
+    try:
+        return {
+            "success": True,
+            "items": db_service.market_data_service.get_catalog(),
+        }
+    except Exception as e:
+        logger.error(f"Error retrieving market data catalog: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving market data catalog: {str(e)}")
+
+
+@app.post("/market-data/sync", response_model=MarketDataSyncResponse)
+async def sync_market_data(request: MarketDataSyncRequest):
+    try:
+        result = db_service.market_data_service.sync_market_data(
+            request.asset_type,
+            symbols=request.symbols,
+            start=request.start,
+            end=request.end,
+            mode=request.mode,
+            out_format=request.out_format,
+            store_type=request.store_type,
+            data_path=request.data_path,
+            correlation_window=request.correlation_window,
+            generate_ir_curve=request.generate_ir_curve,
+            generate_vol_surface=request.generate_vol_surface,
+        )
+        db_service.dynamic_tables.update(db_service.market_data_service.registered_tables)
+        return {"success": True, "result": result}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error syncing market data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error syncing market data: {str(e)}")
+
+
 @app.get("/tables/{table_name}")
 async def get_table_sample(table_name: str, limit: int = 5):
     """
@@ -276,6 +350,8 @@ async def root():
         "endpoints": {
             "health": "/health",
             "schema": "/schema",
+            "market_data_catalog": "/market-data/catalog",
+            "market_data_sync": "/market-data/sync (POST)",
             "tables": "/tables/{table_name}?limit=5",
             "query": "/query (POST)",
             "docs": "/docs",

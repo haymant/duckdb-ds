@@ -13,9 +13,11 @@ import gcsfs
 
 from data.seed import create_dummy_users, create_dummy_orders
 from security.sql_features import find_alpha_table_refs, infer_alpha_request
+from security.sql_parser import extract_table_refs
 from security.sql_validator import prepare_query_for_duckdb
 from services.data_query import DataQueryService
 from services.feature_manager import FeatureManager
+from services.market_data_service import MarketDataService, MARKET_DATA_DEFINITIONS
 
 
 class DuckDBService:
@@ -48,6 +50,7 @@ class DuckDBService:
             },
             data_query_service=self.data_query_service,
         )
+        self.market_data_service = MarketDataService(self.conn)
     
     def _register_tables(self) -> None:
         """Register DataFrames as DuckDB tables."""
@@ -109,6 +112,7 @@ class DuckDBService:
             # Validate and prepare query
             prepared_sql, prepared_params = prepare_query_for_duckdb(sql, params or [])
             self._prepare_alpha_tables(sql)
+            self._prepare_market_data_tables(sql)
             
             # Execute query with parameters
             result = self.conn.execute(prepared_sql, parameters=prepared_params)
@@ -116,12 +120,51 @@ class DuckDBService:
             # Fetch all results
             df_result = result.df()
             
+            # convert pandas/numpy types to plain Python for JSON serialization
+            def _to_python(val):
+                # numpy scalar
+                import numpy as _np
+                import pandas as _pd
+                # pandas NA/NaT
+                if val is _pd.NaT:
+                    return None
+                # numpy nan -> convert to None; avoid calling isnat on plain floats
+                if isinstance(val, float) and _np.isnan(val):
+                    return None
+                # numpy datetime64/timedelta64 may also be NaT
+                if isinstance(val, (_np.datetime64, _np.timedelta64)):
+                    if _np.isnat(val):
+                        return None
+                if isinstance(val, _np.generic):
+                    try:
+                        plain = val.item()
+                    except Exception:
+                        plain = float(val)
+                    # convert the extracted scalar again (e.g. numpy datetime64)
+                    return _to_python(plain)
+                # pandas timestamp or timedelta
+                if isinstance(val, (_pd.Timestamp, _pd.Timedelta)):
+                    # NaT was handled above
+                    return val.isoformat()
+                # other pandas types
+                if isinstance(val, _pd.Categorical):
+                    return val.tolist()
+                return val
+
+            rows = []
+            for row in df_result.values.tolist():
+                rows.append([_to_python(x) for x in row])
+
+            data = []
+            for rec in df_result.to_dict(orient="records"):
+                data.append({k: _to_python(v) for k, v in rec.items()})
+
             return {
                 "success": True,
                 "columns": df_result.columns.tolist(),
-                "rows": df_result.values.tolist(),
+                "rows": rows,
                 "row_count": len(df_result),
-                "data": df_result.to_dict(orient="records"),
+                "data": data,
             }
         except ValueError as e:
             # SQL injection prevention errors
@@ -146,6 +189,34 @@ class DuckDBService:
             request = infer_alpha_request(sql, table_ref)
             self.feature_manager.ensure_registered(request)
             self.dynamic_tables.add(request.sql_table_name)
+
+    def _prepare_market_data_tables(self, sql: str) -> None:
+        """Ensure any market-data tables referenced by the SQL have views registered.
+
+        Unlike alpha tables, market data must be explicitly synced (via the
+        `/market-data/sync` endpoint) before it can be queried. Previously a
+        missing view would result in a generic DuckDB "table does not exist"
+        error during execution, which surfaced as a scary 400 in the API logs.
+        
+        To make the failure more actionable we attempt to register the view
+        here and raise a ``ValueError`` when the underlying CSVs are not
+        present.  This bubbles back through ``execute_query`` resulting in a
+        validation error with a helpful message instead of the opaque catalog
+        error.
+        """
+        # Detect which market-data table names appear in the query.
+        refs = {ref.table_name.lower() for ref in extract_table_refs(sql)}
+        for definition in MARKET_DATA_DEFINITIONS.values():
+            if definition.table_name.lower() in refs:
+                created = self.market_data_service.ensure_view(definition.table_name)
+                if not created:
+                    # view couldn't be created because files weren't found
+                    raise ValueError(
+                        f"Market data '{definition.asset_type}' is not available; "
+                        "run /market-data/sync or place CSVs under the data root"
+                    )
+        # even if views were registered above we still update the dynamic set
+        self.dynamic_tables.update(self.market_data_service.registered_tables)
     
     def get_schema(self) -> Dict[str, List[Dict[str, str]]]:
         """
@@ -156,6 +227,8 @@ class DuckDBService:
         """
         schema_info = {}
         
+        self.market_data_service.register_all_views()
+        self.dynamic_tables.update(self.market_data_service.registered_tables)
         table_names = ["users", "orders", *sorted(self.dynamic_tables)]
 
         for table_name in table_names:
@@ -178,6 +251,8 @@ class DuckDBService:
         Returns:
             Dict with sample data
         """
+        self.market_data_service.register_all_views()
+        self.dynamic_tables.update(self.market_data_service.registered_tables)
         valid_tables = ["users", "orders", *sorted(self.dynamic_tables)]
             
         if table_name not in valid_tables:
