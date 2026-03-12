@@ -35,6 +35,21 @@ def extract_table_refs(sql: str) -> List[TableRef]:
         table_name = match.group("table")
         alias = match.group("alias")
         keyword = match.group("keyword").upper()
+        # ignore common SQL words that sometimes appear after the table
+        # name when no alias is provided; the regex can capture them as
+        # alias in sloppy queries.  treat them as no alias.
+        if alias and alias.upper() in {
+            "WHERE",
+            "GROUP",
+            "ORDER",
+            "LIMIT",
+            "INNER",
+            "LEFT",
+            "RIGHT",
+            "FULL",
+            "ON",
+        }:
+            alias = None
         refs.append(TableRef(table_name=table_name, alias=alias, source_keyword=keyword))
     return refs
 

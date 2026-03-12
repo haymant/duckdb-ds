@@ -174,10 +174,14 @@ class DuckDBService:
                 "error_type": "validation"
             }
         except Exception as e:
-            # Query execution errors
+            # Query execution errors; DuckDB sometimes raises exceptions with
+            # an empty ``str(e)`` which leaves clients confused.  If the
+            # message is blank include the exception's class name or repr()
+            # so we always return something informative.
+            msg = str(e) or repr(e) or e.__class__.__name__
             return {
                 "success": False,
-                "error": f"Query execution error: {str(e)}",
+                "error": f"Query execution error: {msg}",
                 "error_type": "execution"
             }
 
@@ -207,6 +211,11 @@ class DuckDBService:
         # Detect which market-data table names appear in the query.
         refs = {ref.table_name.lower() for ref in extract_table_refs(sql)}
         for definition in MARKET_DATA_DEFINITIONS.values():
+            # alpha datasets are generated on‑demand via the feature manager and
+            # should not be treated as syncable market data.  skipping them
+            # avoids bogus "not available" errors when the catalog lacks CSVs.
+            if definition.asset_type.startswith("alpha"):
+                continue
             if definition.table_name.lower() in refs:
                 created = self.market_data_service.ensure_view(definition.table_name)
                 if not created:

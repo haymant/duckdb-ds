@@ -107,6 +107,22 @@ def validate_sql_query(sql: str) -> Tuple[bool, str]:
     # Ensure no comments
     if "--" in sql or "/*" in sql or "*/" in sql:
         return False, "SQL comments not allowed"
+
+    # heuristic: consecutive comparison expressions without a boolean
+    # operator often indicate a missing AND/OR.  e.g.
+    # ``WHERE a = 'x' b = 'y'`` should be ``... AND b = 'y'``.
+    # look for two comparison expressions with nothing but whitespace
+    # between them; ignore cases where the separating token is a valid
+    # boolean operator (AND/OR).
+    # require that the second identifier is also followed by a comparison
+    # operator; this avoids false positives when the next token is ORDER,
+    # GROUP, LIMIT, etc.
+    consecutive_re = re.compile(
+        r"\b[A-Za-z_][A-Za-z0-9_]*\b\s*(?:=|<|>|<=|>=|!=)\s*'[^']+'\s+"  # first expr
+        r"(?!AND\b|OR\b)([A-Za-z_][A-Za-z0-9_]*)\s*(?:=|<|>|<=|>=|!=)",
+    )
+    if consecutive_re.search(sql):
+        return False, "Possible missing logical operator (AND/OR) between predicates"
     
     # Basic validation: should start with SELECT
     if not sql_upper.startswith("SELECT"):
@@ -168,6 +184,11 @@ def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
 
     If neither pattern is present the input SQL is returned unchanged.
     """
+    # we will eventually return a parameter list used by DuckDB.  since
+    # the SQL rewrite inserts any path placeholders at the *start* of the
+    # query text (before any original WHERE-clause parameters), the
+    # corresponding path values must be prepended to the parameter list in
+    # order to preserve positional semantics.
     new_params = [] if params is None else list(params)
 
     # helper to create one or more GCS paths from symbol patterns
@@ -188,8 +209,8 @@ def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
         prefix = match.group(1)  # "FROM " or "JOIN "
         symbol = match.group(2)
         paths = _make_paths([symbol.upper()])
-        # single path only for named table
-        new_params.extend(paths)
+        # insert path(s) before existing parameters
+        new_params[0:0] = paths
         return f"{prefix}read_parquet(?, hive_partitioning=true)"
 
     named_pattern = r"(\b(?:FROM|JOIN)\s+)ochlvf_([a-zA-Z0-9]+)\b"
@@ -207,14 +228,14 @@ def _rewrite_ochlvf(sql: str, params: List) -> (str, List):
 
         paths = _make_paths(sorted(symbols))
         if paths:
-            # if only one path we can use the simple placeholder syntax
+            # insert path parameters before any existing ones
+            # (they correspond to the placeholders we are about to inject)
             if len(paths) == 1:
-                new_params.append(paths[0])
+                new_params[0:0] = [paths[0]]
                 placeholder_expr = "?"
             else:
-                # build list of placeholders
                 placeholder_expr = ",".join("?" for _ in paths)
-                new_params.extend(paths)
+                new_params[0:0] = paths
                 placeholder_expr = f"[{placeholder_expr}]"
             sql = re.sub(generic_pattern,
                          rf"\1read_parquet({placeholder_expr}, hive_partitioning=true, union_by_name=true)",

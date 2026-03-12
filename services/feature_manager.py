@@ -148,8 +148,15 @@ class FeatureManager:
             "freq": self.config.get("freq", "day"),
         }
         if alpha_request.feature_name == "alpha360":
-            kwargs["fit_start_time"] = self.config.get("fit_start_time", alpha_request.start_time)
-            kwargs["fit_end_time"] = self.config.get("fit_end_time", alpha_request.end_time)
+            # alpha360 processors may insist on having fit window values; do
+            # not pass the keys at all if we don't know them, avoiding the
+            # assertion raised by featureHandler.  callers can set
+            # ``ALPHA_FIT_START_TIME``/``_END_TIME`` in config when required.
+            fit_start = self.config.get("fit_start_time") or alpha_request.start_time
+            fit_end = self.config.get("fit_end_time") or alpha_request.end_time
+            if fit_start is not None and fit_end is not None:
+                kwargs["fit_start_time"] = fit_start
+                kwargs["fit_end_time"] = fit_end
         return kwargs
 
     def _ensure_runtime_initialized(self):

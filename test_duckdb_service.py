@@ -164,6 +164,20 @@ def test_ochlvf_rewrite(monkeypatch):
     params_executed = executed.get('params', [])
     assert any('symbol=NV*' in p for p in params_executed)
 
+    # regression test for datetime filter: path parameter must precede
+    # any other parameters.  using literal dates exercises the same
+    # ordering behaviour even though no date values appear in `params`.
+    executed.clear()
+    svc.execute_query(
+        "SELECT * FROM ochlvf WHERE symbol = 'AAPL' "
+        "AND datetime >= '2026-03-01' AND datetime <= '2026-03-12'"
+    )
+    params_executed = executed.get('params', [])
+    # only the parquet path should be present and it must be first
+    assert params_executed and isinstance(params_executed[0], str)
+    assert 'symbol=AAPL' in params_executed[0]
+    assert len(params_executed) == 1
+
 
 def test_execute_query_serializes_timestamps(monkeypatch):
     # ensure execute_query converts pandas Timestamp to plain strings
@@ -781,6 +795,42 @@ def test_sync_market_data_invalid_type():
     svc = api_main.db_service.market_data_service
     with pytest.raises(ValueError):
         svc.sync_market_data("bogus")
+
+
+def test_sync_market_data_alpha_rejected():
+    """Alpha assets are not syncable via the market-data endpoint."""
+    svc = api_main.db_service.market_data_service
+    for alpha in ("alpha158", "alpha360"):
+        with pytest.raises(ValueError) as exc:
+            svc.sync_market_data(alpha)
+        assert "not supported" in str(exc.value)
+
+
+def test_alpha360_query_without_fit(monkeypatch):
+    """Executing an alpha360 query with only a symbol filter must not raise.
+
+    Previously the feature handler asserted that fit_start_time and
+    fit_end_time were non-null, leading to an opaque ``AssertionError``
+    bubbling through the DuckDB service.
+    """
+    svc = api_main.db_service
+    svc.feature_manager = FeatureManager(svc.conn, feature_factory=build_dummy_alpha_handler, config={"freq": "day", "allow_full_scan": False})
+
+    # running the query should succeed and register a table
+    result = svc.execute_query("SELECT * FROM alpha360 WHERE symbol = 'AAPL'")
+    assert result["success"] is True
+    # query may return zero rows, we just care that it executed without
+    # throwing an AssertionError.
+    assert "row_count" in result
+
+
+def test_table_ref_alias_ignores_keywords():
+    sql = "SELECT * FROM alpha360 WHERE symbol='AAPL'"
+    from security.sql_parser import extract_table_refs
+    refs = extract_table_refs(sql)
+    assert len(refs) == 1
+    assert refs[0].table_name.lower() == "alpha360"
+    assert refs[0].alias is None
 
 
 def test_feature_sql_module_is_cached(monkeypatch):

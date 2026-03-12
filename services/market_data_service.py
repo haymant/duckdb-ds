@@ -123,6 +123,27 @@ MARKET_DATA_DEFINITIONS: dict[str, MarketDataDefinition] = {
         common_keys=("symbol", "expiration", "strike"),
         default_symbols=("AAPL",),
     ),
+    # alpha datasets are generated on‑the‑fly by feature_manager; we don't
+    # store CSV files locally.  path_parts is chosen to produce an empty
+    # glob so that ``available`` is always False in the catalog.
+    "alpha158": MarketDataDefinition(
+        asset_type="alpha158",
+        label="Alpha158",
+        table_name="alpha158",
+        path_parts=("alpha158", "*.csv"),
+        description="Alpha158 feature set (no local files)",
+        common_keys=("symbol", "datetime"),
+        default_symbols=("AAPL",),
+    ),
+    "alpha360": MarketDataDefinition(
+        asset_type="alpha360",
+        label="Alpha360",
+        table_name="alpha360",
+        path_parts=("alpha360", "*.csv"),
+        description="Alpha360 feature set (no local files)",
+        common_keys=("symbol", "datetime"),
+        default_symbols=("AAPL",),
+    ),
 }
 
 
@@ -176,6 +197,12 @@ class MarketDataService:
         normalized = asset_type.strip().lower()
         if normalized not in MARKET_DATA_DEFINITIONS:
             raise ValueError(f"Unsupported market data type: {asset_type}")
+        # alpha datasets are materialised on‑demand and do not participate in
+        # the traditional download/upload workflow.  Reject sync attempts so
+        # callers (including the UI) cannot be confused by a no‑op or by the
+        # featureSQL runner blowing up.
+        if normalized.startswith("alpha"):
+            raise ValueError(f"market data sync not supported for asset type: {asset_type}")
 
         # when using GCS we prefer the explicit data_path argument, but
         # fall back to the GCS_BUCKET_NAME environment variable if nothing
