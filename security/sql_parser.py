@@ -77,29 +77,42 @@ def _prefixed_column_pattern(column: str, aliases: Optional[Sequence[str]] = Non
     return rf"(?:\b(?:{alias_pattern})\.{column}\b|\b{column}\b)"
 
 
-def extract_symbol_filters(sql: str, aliases: Optional[Sequence[str]] = None) -> Set[str]:
+def _extract_column_filters(sql: str, column: str, aliases: Optional[Sequence[str]] = None) -> Set[str]:
+    """Generic helper used by various callers to pull distinct values from
+    simple equality/IN/LIKE predicates on a single column.
+
+    The implementation was originally written in ``extract_symbol_filters``
+    and duplicated elsewhere; factoring it out makes the behaviour easier to
+    test and extends it for additional columns (notably ``instrument`` in
+    alpha tables) without touching the global symbol logic.
+    """
     where_clause = extract_where_clause(sql)
     if not where_clause:
         return set()
 
-    symbol_pattern = _prefixed_column_pattern("symbol", aliases)
-    symbols: Set[str] = set()
+    col_pattern = _prefixed_column_pattern(column, aliases)
+    results: Set[str] = set()
 
-    eq_re = re.compile(rf"{symbol_pattern}\s*=\s*'([^']+)'", re.IGNORECASE)
-    in_re = re.compile(rf"{symbol_pattern}\s+IN\s*\(([^)]+)\)", re.IGNORECASE)
-    like_re = re.compile(rf"{symbol_pattern}\s+LIKE\s*'([^']+)'", re.IGNORECASE)
+    eq_re = re.compile(rf"{col_pattern}\s*=\s*'([^']+)'", re.IGNORECASE)
+    in_re = re.compile(rf"{col_pattern}\s+IN\s*\(([^)]+)\)", re.IGNORECASE)
+    like_re = re.compile(rf"{col_pattern}\s+LIKE\s*'([^']+)'", re.IGNORECASE)
 
     for match in eq_re.finditer(where_clause):
-        symbols.add(match.group(1).upper())
+        results.add(match.group(1).upper())
 
     for match in in_re.finditer(where_clause):
         for value in re.findall(r"'([^']+)'", match.group(1)):
-            symbols.add(value.upper())
+            results.add(value.upper())
 
     for match in like_re.finditer(where_clause):
-        symbols.add(translate_like_to_glob(match.group(1).upper()))
+        results.add(translate_like_to_glob(match.group(1).upper()))
 
-    return symbols
+    return results
+
+
+def extract_symbol_filters(sql: str, aliases: Optional[Sequence[str]] = None) -> Set[str]:
+    # retain old public API but delegate to the generic helper
+    return _extract_column_filters(sql, "symbol", aliases)
 
 
 def extract_datetime_range(sql: str, aliases: Optional[Sequence[str]] = None) -> Tuple[Optional[str], Optional[str]]:

@@ -38,7 +38,22 @@ def infer_alpha_request(sql: str, table_ref: TableRef) -> AlphaRequest:
     feature_name = match.group(1).lower()
     explicit_symbol = match.group(2)
     aliases = [alias for alias in (table_ref.alias, table_ref.table_name) if alias]
+    # alpha tables use the column name ``instrument`` rather than
+    # ``symbol``.  ``extract_symbol_filters`` already handles the common
+    # case where callers refer to ``symbol`` (including when the table name
+    # embeds a symbol suffix), but we also need to accept predicates like
+    # ``a.instrument = 'AAPL'`` so that validation logic in
+    # ``FeatureManager`` can enforce explicit filters correctly.
     inferred = extract_symbol_filters(sql, aliases=aliases)
+    # explicitly look for ``instrument`` clauses too and merge the results.
+    # ``_extract_column_filters`` is imported via the public API of the
+    # parser so we access it by name here.
+    try:
+        from security.sql_parser import _extract_column_filters
+        inferred |= _extract_column_filters(sql, "instrument", aliases)
+    except ImportError:
+        pass
+
     if explicit_symbol:
         inferred.add(explicit_symbol.upper())
     start_time, end_time = extract_datetime_range(sql, aliases=aliases)

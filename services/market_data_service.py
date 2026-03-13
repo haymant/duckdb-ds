@@ -10,6 +10,12 @@ from pathlib import Path
 import sys
 from typing import Any, Iterable
 
+# ensure featureSQL and related code see project env vars when duck-server
+# imports them; this mirrors the dotenv loading in main.py
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=".env.local", override=True)
+load_dotenv()
+
 from security.sql_parser import extract_table_refs
 
 
@@ -164,9 +170,30 @@ class MarketDataService:
 
     def get_catalog(self) -> list[dict[str, Any]]:
         root = Path(self.get_default_root())
+        bucket = os.getenv("GCS_BUCKET_NAME")
+        store = None
+        if bucket:
+            # lazily import to avoid adding gcsfs if not needed
+            from featureSQL.storage import get_storage
+            try:
+                store = get_storage("gcs", bucket)
+            except Exception:
+                # if credentials are invalid just ignore and fall back to fs
+                store = None
         items: list[dict[str, Any]] = []
         for definition in MARKET_DATA_DEFINITIONS.values():
             files = self._resolve_local_files(definition, str(root))
+            # if no local files and we have a bucket store, try listing there
+            if not files and store:
+                try:
+                    # split into directory and last-part pattern
+                    parts = list(definition.path_parts)
+                    pattern = parts.pop()
+                    prefix_dir = "/".join(parts)
+                    bucket_files = store.glob(prefix_dir, pattern)
+                    files = bucket_files
+                except Exception:
+                    files = []
             items.append(
                 {
                     **asdict(definition),
@@ -355,15 +382,95 @@ class MarketDataService:
         if definition is None:
             return False
         base = root or self.get_default_root()
-        if not self._local_source_exists(definition, base):
-            return False
 
-        source = self._duckdb_source(definition, base)
+        # determine where the source actually lives.  ``_resolve_local_files``
+        # will return an empty list when there are no matching CSVs on disk, so
+        # we can use that as the primary check.  If the local filesystem is
+        # empty but a bucket is configured and contains files we prefer the
+        # GCS path – previously ``_local_source_exists`` returned True for both
+        # cases which meant we would always fall through to the local path and
+        # end up generating a view that referenced ``/tmp/...`` even though the
+        # data was only in GCS.
+        local_files = self._resolve_local_files(definition, base)
+        if local_files:
+            # easy case: we have local CSVs, build a pattern for DuckDB
+            source = self._duckdb_source(definition, base)
+        else:
+            # no local files; check bucket explicitly
+            bucket = os.getenv("GCS_BUCKET_NAME")
+            if bucket:
+                try:
+                    from featureSQL.storage import get_storage
+                    store = get_storage("gcs", bucket)
+                    parts = list(definition.path_parts)
+                    pattern = parts.pop()
+                    prefix_dir = "/".join(parts)
+                    files = store.glob(prefix_dir, pattern)
+                    if files:
+                        source = f"gs://{bucket}/{files[0]}"
+                    else:
+                        return False
+                except Exception:
+                    # any error just means we can't register yet; view will
+                    # be attempted again on the next query or sync.
+                    return False
+            else:
+                return False
+
         escaped_source = source.replace("'", "''")
-        self.conn.execute(
-            f"CREATE OR REPLACE VIEW {definition.table_name} AS "
-            f"SELECT * FROM read_csv_auto('{escaped_source}', union_by_name=true, filename=true, sample_size=-1)"
-        )
+
+        def _read_header(src: str) -> list[str]:
+            """Read the first line of a CSV file (header) from a local or GCS path."""
+            import csv
+
+            if src.startswith("gs://"):
+                _, rest = src.split("gs://", 1)
+                bucket, _, blob = rest.partition("/")
+                from featureSQL.storage import get_storage
+
+                store = get_storage("gcs", bucket)
+                text = store.read_text(blob)
+            else:
+                with open(src, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read(4096)
+
+            line = text.splitlines()[0] if text else ""
+            return next(csv.reader([line])) if line else []
+
+        if definition.table_name == "market_vol_surface":
+            cols = _read_header(source)
+            computed: list[str] = []
+
+            if "implied_vol" in cols:
+                computed.append("t.implied_vol AS implied_vol")
+            elif "impliedVolatility" in cols:
+                computed.append("t.impliedVolatility AS implied_vol")
+            else:
+                computed.append("NULL::DOUBLE AS implied_vol")
+
+            if "moneyness" in cols:
+                computed.append("t.moneyness AS moneyness")
+            else:
+                computed.append("NULL::DOUBLE AS moneyness")
+
+            if "total_variance" in cols:
+                computed.append("t.total_variance AS total_variance")
+            else:
+                computed.append("NULL::DOUBLE AS total_variance")
+
+            extras = ", ".join(computed)
+            view_sql = (
+                f"CREATE OR REPLACE VIEW {definition.table_name} AS "
+                f"SELECT t.*, {extras} "
+                f"FROM read_csv_auto('{escaped_source}', union_by_name=true, "
+                f"filename=true, sample_size=-1) AS t"
+            )
+        else:
+            view_sql = (
+                f"CREATE OR REPLACE VIEW {definition.table_name} AS "
+                f"SELECT * FROM read_csv_auto('{escaped_source}', union_by_name=true, filename=true, sample_size=-1)"
+            )
+        self.conn.execute(view_sql)
         self.registered_tables.add(definition.table_name)
         return True
 
@@ -379,6 +486,10 @@ class MarketDataService:
         return str(Path(base).joinpath(*parts))
 
     def _local_source_exists(self, definition: MarketDataDefinition, root: str) -> bool:
+        # this helper only checks the local filesystem; callers that need to
+        # consider remote data should call ``_resolve_local_files`` or perform a
+        # separate bucket lookup.  returning True here when only a bucket copy
+        # exists caused ``ensure_view`` to pick a dead ``/tmp`` path.
         return bool(self._resolve_local_files(definition, root))
 
     def _resolve_local_files(self, definition: MarketDataDefinition, root: str) -> list[str]:

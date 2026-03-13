@@ -262,6 +262,15 @@ def test_sql_features_infers_alpha_request():
     assert request.start_time == "2019-01-01"
 
 
+def test_infer_alpha_request_respects_instrument_predicate():
+    sql = "SELECT * FROM alpha158 a WHERE a.instrument = 'AAPL' AND a.datetime >= '2020-01-01'"
+    table_ref = find_alpha_table_refs(sql)[0]
+    request = infer_alpha_request(sql, table_ref)
+    assert request.feature_name == "alpha158"
+    assert request.instruments == {"AAPL"}
+    assert request.start_time == "2020-01-01"
+
+
 def test_feature_manager_incremental_cache():
     conn = duckdb.connect(":memory:")
     manager = FeatureManager(conn, feature_factory=build_dummy_alpha_handler, config={"freq": "day"})
@@ -271,6 +280,33 @@ def test_feature_manager_incremental_cache():
     assert len(snapshot) == 1
     cached_instruments = next(iter(snapshot.values()))
     assert cached_instruments == {"AAPL"}
+
+
+def test_vol_surface_view_aliasing(monkeypatch):
+    # ensure the view SQL for vol_surface includes a fallback for
+    # impliedVolatility -> implied_vol
+    svc = MarketDataService(None)
+    executed = []
+    class FakeConn:
+        def execute(self, sql, *args, **kwargs):
+            executed.append(sql)
+    svc.conn = FakeConn()
+    # simulate empty local files and a single bucket file
+    monkeypatch.setattr(svc, '_resolve_local_files', lambda d, r: [])
+    class FakeStore:
+        def glob(self, prefix, pattern):
+            return ['analytics/vol_surface.csv']
+    import featureSQL.storage
+    monkeypatch.setattr(featureSQL.storage, 'get_storage', lambda st, name: FakeStore())
+    monkeypatch.setenv('GCS_BUCKET_NAME', 'bucket')
+
+    svc.ensure_view('market_vol_surface', root='ignored')
+    assert executed, "no view SQL produced"
+    sql = executed[0]
+    assert 'AS t' in sql, "view should alias the CSV source as 't'"
+    assert 'COALESCE(t.implied_vol, t.impliedVolatility) AS implied_vol' in sql
+    assert 'COALESCE(t.moneyness, t.moneyness) AS moneyness' in sql
+    assert 'COALESCE(t.total_variance, t.total_variance) AS total_variance' in sql
 
     request_multi = infer_alpha_request(
         "SELECT * FROM alpha158 WHERE symbol IN ('AAPL', 'MSFT')",
@@ -300,22 +336,32 @@ def test_feature_manager_uses_duck_server_data_query_when_provider_uri_missing()
     assert "AAPL" in sql
 
 
-def test_feature_manager_real_query_no_placeholder_mismatch(tmp_path):
-    # this regression test exercises the real DataQueryService, which uses
-    # prepare_query_for_duckdb and therefore performs the ochlvf rewrite.
-    # prior to the fix the internal provider query would produce two '?' but
-    # only one parameter (symbol), leading to a validation error bubbled to
-    # the outer execute_query call.  verify that no exception is thrown and
-    # some data is returned.
+def test_ensure_view_prefers_bucket_when_local_missing(monkeypatch):
+    svc = DuckDBService()
+    # capture any SQL executed
+    executed = []
+    class FakeConn:
+        def execute(self, sql, *args, **kwargs):
+            executed.append(sql)
+    monkeypatch.setattr(svc, "conn", FakeConn())
 
-    # ensure tests never attempt to hit real GCS buckets; clear any
-    # credentials that might have been loaded from .env.local and redirect
-    # ochlvf paths to a temporary local dataset.
-    import os
-    for key in ("GCS_KEY_ID", "GCS_KEY_SECRET", "GCS_SC_JSON", "GCS_BUCKET_NAME"):
-        os.environ.pop(key, None)
-    os.environ["MARKET_DATA_ROOT"] = str(tmp_path / "market-data")
-    # create a minimal parquet file for symbol AAPL so the read_parquet call
+    # simulate no local CSVs
+    monkeypatch.setattr(svc, "_resolve_local_files", lambda definition, root: [])
+
+    # fake storage that returns a single file path
+    class FakeStore:
+        def glob(self, prefix, pattern):
+            assert prefix == "feature-csv/fx"
+            assert pattern == "*.csv"
+            return ["feature-csv/fx/bucket.csv"]
+    import featureSQL.storage
+    monkeypatch.setattr(featureSQL.storage, "get_storage", lambda st, name: FakeStore())
+
+    monkeypatch.setenv("GCS_BUCKET_NAME", "mybucket")
+
+    svc.ensure_view("market_fx", root="/tmp/unused")
+    assert executed, "no view SQL was generated"
+    assert "gs://mybucket/feature-csv/fx/bucket.csv" in executed[0]
     # in the feature handler succeeds
     import pandas as pd
     data_dir = tmp_path / "market-data" / "symbol=AAPL"
